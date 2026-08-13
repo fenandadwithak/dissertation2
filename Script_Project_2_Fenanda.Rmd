@@ -26,6 +26,14 @@ knitr::opts_chunk$set(
 
 # Global seed for reproducibility
 set.seed(42)
+
+#dont forget to install packages!
+# install.packages(c(
+#  "tidyverse", "MASS", "broom", "broom.mixed", "glmmTMB",
+#  "performance", "DHARMa", "scales", "janitor", "readxl",
+#  "corrplot", "sf", "patchwork", "conflicted"
+#))
+# delete "#" from row 30-34
 ```
 
 # Packages
