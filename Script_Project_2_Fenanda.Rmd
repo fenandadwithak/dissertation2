@@ -1,0 +1,849 @@
+---
+title: "Frequent A&E Attendance in Scotland: A Multilevel Analysis of Deprivation, Demographic, and Disease Burden Factors"
+subtitle: "Objective 1b - Frequent Attenders"
+author: "Fenanda Dwitha Kurniasari (S2744048)"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    highlight: tango
+    df_print: paged
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+
+# Global seed for reproducibility
+set.seed(42)
+```
+
+# Packages
+
+```{r packages}
+library(tidyverse)
+library(MASS)          # loaded for glm.nb() compatibility checks only; glmmTMB is used for all reported models
+library(broom)
+library(broom.mixed)
+library(glmmTMB)
+library(dplyr)
+library(performance)   # icc(), check_collinearity()
+library(DHARMa)
+library(scales)
+library(janitor)
+library(readxl)
+library(corrplot)
+library(sf)
+library(patchwork)
+library(conflicted)
+
+# MASS exports its own select() (used internally by stepAIC-style model
+# selection), which silently masks dplyr::select() once MASS is loaded
+# after tidyverse. Rather than rely on remembering to write dplyr::select()
+# everywhere, we resolve the conflict once here so any accidental bare
+# select()/filter()/rename() call fails loudly at the point of first use
+# instead of throwing a confusing "unused arguments" error downstream.
+conflicted::conflicts_prefer(dplyr::select, dplyr::filter, dplyr::rename, .quiet = TRUE)
+
+theme_set(theme_minimal(base_size = 12))
+eda_theme <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, colour = "grey40", margin = margin(b = 8)),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill = NA, linewidth = 0.6),
+    axis.title = element_text(size = 10.5)
+  )
+
+```
+
+------------------------------------------------------------------------
+
+# Data and Exploration
+
+## Data Sources (2.1)
+
+Three sources feed this analysis: PHS Multiple Attendances Demographics (the outcome, one row per stratum), PHS General Practice disease prevalence at Health Board level, and NRS mid-year 2025 population estimates used as the model offset.
+
+```{r data-sources}
+#PHS Multiple Attendances Demographics (rolling 12 months to April 2026)
+#one row per stratum (hbt x age x sex x deprivation x department_type)
+multiple_attendance <- read.csv("Data/multiple attendance_demographic.csv",
+                                na.strings = c("", "NA")) %>% clean_names()
+
+#PHS General Practice disease prevalence, Health Board level, 2025
+disease_prevalence_raw <- read_excel("Data/diseaseprevalenceingeneralpractice_board_total.xlsx",
+                                     sheet = "DP_Board_total") %>% clean_names()
+
+# spatial data
+hb_boundaries <- st_read("Data/SG_NHS_HealthBoards_2019/SG_NHS_HealthBoards_2019.shp")
+
+# Area name -> Health Board code (hbt)
+hb_name_to_code <- tibble::tribble(
+  ~gp_practice_area, ~hbt,
+  "NHS Ayrshire and Arran", "S08000015",
+  "NHS Borders", "S08000016",
+  "NHS Dumfries and Galloway","S08000017",
+  "NHS Fife", "S08000029",
+  "NHS Forth Valley",  "S08000019",
+  "NHS Grampian","S08000020",
+  "NHS Greater Glasgow and Clyde", "S08000031",
+  "NHS Highland","S08000022",
+  "NHS Lanarkshire","S08000032",
+  "NHS Lothian", "S08000024",
+  "NHS Orkney", "S08000025",
+  "NHS Shetland", "S08000026",
+  "NHS Tayside","S08000030",
+  "NHS Western Isles","S08000028"
+)
+
+# ten candidate conditions (kept wide here, narrowed after the
+# correlation/VIF check)
+hbt_disease_prevalence <- disease_prevalence_raw %>%
+  filter(area_type == "Board", age == "All", sex == "All") %>%
+  left_join(hb_name_to_code, by = "gp_practice_area") %>%
+  filter(!is.na(hbt)) %>%
+  transmute(
+    hbt, year,
+    rate_copd  = rate_chronic_obstructive_pulmonary_disease_copd,
+    rate_chd  = rate_coronary_heart_disease_chd,
+    rate_heartfailure = rate_heart_failure,
+    rate_diabetes  = rate_diabetes,
+    rate_ckd   = rate_chronic_kidney_disease_ckd,
+    rate_epilepsy  = rate_epilepsy,
+    rate_dementia  = rate_dementia,
+    rate_mentalhealth = rate_mental_health,
+    rate_depression = rate_depression,
+    rate_palliative = rate_palliative_care
+  )
+
+# NRS mid-year 2025 population, by Health Board x age x sex, the finest
+# grain available (no deprivation or department-type split exists, see in in 3.1)
+population_raw <- read_excel("Data/data-mid-year-population-estimates-2025.xlsx",
+                             sheet = "Table 1", skip = 3) %>% clean_names() %>% mutate(year=2025L) 
+
+age_col_map <- population_raw %>% dplyr::select(matches("^x[0-9]+(_and_over)?$")) %>% names()
+
+population_long <- population_raw %>%
+  dplyr::filter(area_type == "Health board", sex %in% c("Females", "Males")) %>%
+  dplyr::select(year, area_name, area_code, sex, all_of(age_col_map)) %>%
+  pivot_longer(cols = all_of(age_col_map), names_to = "age_col", values_to = "population") %>%
+  mutate(
+    single_age = if_else(age_col == "x90_and_over", 90L,
+                          as.integer(str_remove(age_col, "^x"))),
+    # collapse single-year ages into the same six bands used in the model
+    age = case_when(
+      single_age < 18             ~ "Under 18",
+      between(single_age, 18, 24) ~ "18-24",
+      between(single_age, 25, 39) ~ "25-39",
+      between(single_age, 40, 64) ~ "40-64",
+      between(single_age, 65, 74) ~ "65-74",
+      single_age >= 75            ~ "75 plus"
+    )
+  )
+
+hbt_age_sex_population <- population_long %>%
+  group_by(hbt = area_code, age, sex, year) %>%
+  summarise(population = sum(population), .groups = "drop") %>%
+  mutate(age = factor(age, levels = c("Under 18", "18-24", "25-39",
+                                       "40-64", "65-74", "75 plus")))
+```
+
+## Data Preprocessing (2.2)
+
+### Deriving Frequent Attendance (2.2.1)
+
+Frequent attendance is derived directly from Equations 2.1-2.2 in the report: `Total = n1+n2+n3+n4+n5plus`, `Frequent = n3+n4+n5plus`. The 3+ threshold follows Reid et al. (2025) and common practice in the literature, sitting below PHS's own clinical monitoring definition (Section 2.2.1 of the report explains why a three-month clustering threshold isn't supportable with this data).
+
+### Data cleansing (2.2.2)
+
+Missing age/sex/deprivation are checked before any exclusion, since the pattern of missingness (Figure 1) motivates treating this as MNAR rather than a simple data-entry gap.
+
+```{r missing-data}
+# Figure 1 - deprivation (17.1%) missing far more than age/sex (1.4% each);
+# missing deprivation reflects no fixed Scottish postcode
+# (homeless/tourists/short-term visitors), so this is MNAR not MCAR
+missing_summary <- multiple_attendance %>%
+  dplyr::select(age, sex, deprivation, department_type,
+                one_attendance, two_attendances, three_attendances,
+                four_attendances, five_plus_attendances) %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(pct_missing = n_missing / nrow(multiple_attendance) * 100) %>%
+  arrange(desc(pct_missing))
+
+print(missing_summary)
+
+ggplot(missing_summary, aes(x = reorder(variable, pct_missing), y = pct_missing)) +
+  geom_col(fill = "firebrick", width = 0.65) +
+  geom_text(aes(label = paste0(round(pct_missing, 1), "%")), hjust = -0.15, size = 3.4) +
+  coord_flip(clip = "off") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Missing data by variable (raw multiple-attendance file)",
+       x = NULL, y = "% missing") +
+  eda_theme
+ggsave("Figures/fig1_missing_data.png", width = 7.5, height = 4.5, dpi = 300)
+```
+
+We proceed under a stated MAR simplification and analyse complete cases (Section 2.2.2 of the report). Imputation was not attempted, since assigning a deprivation value to people without a fixed address would fabricate a profile for them.
+
+```{r build-freq-data}
+# complete-case exclusion + derive frequent/total (Eqns 2.1-2.2) + join
+# disease prevalence and population
+freq_data_prefilter <- multiple_attendance %>%
+  filter(!is.na(age), !is.na(sex), !is.na(deprivation)) %>%
+  mutate(
+    age = factor(age, levels = c("Under 18", "18-24", "25-39",
+                                  "40-64", "65-74", "75 plus")),
+    sex = factor(sex),
+    sex_pop = ifelse(sex == "Female", "Females", "Males"),
+    deprivation = factor(deprivation, levels = 1:5,
+                          labels = c("1 (most deprived)", "2", "3", "4",
+                                     "5 (least deprived)")),
+    department_type = factor(department_type),
+    total_individuals = one_attendance + two_attendances + three_attendances +
+                         four_attendances + five_plus_attendances,
+    frequent = three_attendances + four_attendances + five_plus_attendances,
+    prop_frequent = frequent / total_individuals
+  ) %>%
+  filter(total_individuals > 0) %>%
+  left_join(hbt_disease_prevalence %>% filter(year == 2025), by = "hbt") %>%
+  left_join(hbt_age_sex_population %>% filter(year == 2025) %>% rename(sex_pop = sex),
+            by = c("hbt", "age", "sex_pop"))
+
+# check, not silently drop, rows losing their population match at the join
+n_dropped_join <- sum(is.na(freq_data_prefilter$population))
+cat("Rows dropped due to unmatched population join:", n_dropped_join, "\n")
+
+freq_data <- freq_data_prefilter %>% filter(!is.na(population), population > 0)
+cat("Final analysis strata (n):", nrow(freq_data), "\n")
+```
+
+## Exploratory Data Analysis (2.3)
+
+### Distribution of Frequent Attendance (2.3.1)
+
+The mean/variance comparison here is the direct justification for negative binomial over Poisson, used formally again in Section 3.1.
+
+```{r fig2-distribution}
+dispersion_summary <- freq_data %>%
+  summarise(n = n(), mean = mean(frequent), variance = var(frequent),
+            sd = sd(frequent), var_mean_ratio = variance / mean)
+print(dispersion_summary)
+
+ggplot(freq_data, aes(x = frequent)) +
+  geom_histogram(binwidth = 20, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = dispersion_summary$mean, colour = "firebrick",
+             linetype = "dashed", linewidth = 0.8) +
+  annotate("label", x = dispersion_summary$mean, y = Inf,
+           label = paste0("Mean = ", round(dispersion_summary$mean, 1)),
+           colour = "firebrick", fill = "white", size = 3.4,
+           vjust = 1.5, hjust = -0.1, label.size = 0.3) +
+  annotate("label", x = max(freq_data$frequent, na.rm = TRUE) * 0.55, y = Inf,
+           label = paste0(
+             "n = ", dispersion_summary$n, "\n",
+             "Mean = ", round(dispersion_summary$mean, 2), "\n",
+             "SD = ", round(dispersion_summary$sd, 2), "\n",
+             "Variance = ", round(dispersion_summary$variance, 2), "\n",
+             "Var/Mean ratio = ", round(dispersion_summary$var_mean_ratio, 1)),
+           hjust = 0, vjust = 1.1, size = 3.2, colour = "grey20",
+           fill = "grey95", label.size = 0.3) +
+  labs(title = "Distribution of frequent-attender counts per stratum",
+       subtitle = paste0("n = ", dispersion_summary$n, " strata"),
+       x = "Frequent attenders (count)", y = "Number of strata") +
+  eda_theme
+ggsave("Figures/fig2_frequent_distribution.png", width = 8, height = 5.5, dpi = 300)
+```
+
+### Demographic and Deprivation Patterns (2.3.2)
+
+One combined figure only, deprivation x age x sex together, since that is what the report interprets: whether the deprivation gradient holds within every age/sex panel.
+
+```{r fig3-demographics}
+by_deprivation_age_sex <- freq_data %>%
+  group_by(deprivation, age, sex) %>%
+  summarise(frequent = sum(frequent), total = sum(total_individuals), .groups = "drop") %>%
+  mutate(prop_frequent = frequent / total)
+
+ggplot(by_deprivation_age_sex, aes(x = deprivation, y = prop_frequent, fill = sex)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  geom_text(aes(label = scales::percent(prop_frequent, accuracy = 0.1)),
+            position = position_dodge(width = 0.75),
+            vjust = -0.4, size = 2.4, fontface = "bold", colour = "grey20") +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.18))) +
+  scale_fill_manual(values = c("Female" = "#F26D8B", "Male" = "#FDC08A")) +
+  facet_wrap(~ age, nrow = 2) +
+  labs(title = "Proportion of individuals with 3+ A&E attendances,\nby SIMD quintile, age group, and sex",
+       x = "SIMD quintile", y = "% frequent attenders", fill = "Sex") +
+  eda_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+        strip.text = element_text(face = "bold", size = 9),
+        legend.position = "top")
+ggsave("Figures/fig3_deprivation_age_sex.png", width = 10, height = 7, dpi = 300)
+```
+
+### Disease Prevalence and Frequent Attendance (2.3.3)
+
+One correlation matrix does two jobs: shows the outcome association, and flags collinearity among the ten candidates (|r| > 0.7 is treated as a concern, Dormann et al. 2013).
+
+```{r fig4-disease-correlation}
+board_level_summary <- freq_data %>%
+  group_by(hbt) %>%
+  summarise(frequent = sum(frequent), total = sum(total_individuals), .groups = "drop") %>%
+  mutate(prop_frequent = frequent / total) %>%
+  left_join(hbt_disease_prevalence %>% filter(year == 2025), by = "hbt")
+
+disease_cor_mat <- board_level_summary %>%
+  dplyr::select(prop_frequent, starts_with("rate_")) %>%
+  cor(use = "pairwise.complete.obs")
+
+print(round(disease_cor_mat, 2))
+
+png("Figures/fig4_disease_correlation.png", width = 950, height = 850, res = 150)
+corrplot(disease_cor_mat, method = "color", type = "full",
+         addCoef.col = "black", number.cex = 0.65,
+         tl.col = "black", tl.srt = 45, tl.cex = 0.75,
+         col = colorRampPalette(c("#4575B4", "white", "#D63C7E"))(200),
+         title = "Pearson correlation: frequent attenders and\ncandidate disease-prevalence rates (Board level)",
+         mar = c(0, 0, 3, 0))
+dev.off()
+```
+
+```{r collinearity-check}
+# collinearity check via VIF on a "kitchen sink" model with all ten rates 
+# narrows the candidate list before the final model is fitted
+obj1b_kitchensink <- glmmTMB(
+  frequent ~ age + sex + deprivation + department_type +
+    rate_copd + rate_chd + rate_heartfailure + rate_diabetes + rate_ckd +
+    rate_epilepsy + rate_dementia + rate_mentalhealth + rate_depression +
+    rate_palliative + offset(log(population)) + (1 | hbt),
+  family = nbinom2, data = freq_data
+)
+check_collinearity(obj1b_kitchensink)
+
+```
+
+### Population Adjustment (2.3.4)
+
+Rates, not raw counts, are what matter here; a large board like Greater Glasgow and Clyde would otherwise always look worse than NHS Orkney simply from population size.
+
+```{r fig5-population-map}
+hbt_total_population <- hbt_age_sex_population %>%
+  filter(year == 2025) %>%
+  group_by(hbt) %>%
+  summarise(total_population = sum(population), .groups = "drop")
+
+print(names(hb_boundaries))   # confirm code/name columns before joining
+
+hb_pop_map <- hb_boundaries %>%
+  left_join(hbt_total_population, by = c("HBCode" = "hbt"))
+
+ggplot(hb_pop_map) +
+  geom_sf(aes(fill = total_population), colour = "white", linewidth = 0.4) +
+  geom_sf_text(aes(label = HBName), size = 2.6, colour = "grey15",
+               fontface = "bold", check_overlap = TRUE) +
+  scale_fill_gradientn(
+    colours = c("#FFF6B7", "#FEE0A6", "#FDC08A", "#FA9070", "#F26D8B", "#D63C7E"),
+    trans = "sqrt", labels = scales::comma,
+    breaks = scales::pretty_breaks(n = 5), name = "Population\n(2025)"
+  ) +
+  labs(title = "Population Distribution Across\nNHS Scotland Health Boards",
+       subtitle = "Mid-year population estimates, 2025",
+       caption = "Source: National Records of Scotland") +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5, lineheight = 1.1),
+    plot.subtitle = element_text(size = 10.5, colour = "grey40", hjust = 0.5, margin = margin(b = 10)),
+    plot.caption = element_text(size = 8.5, colour = "grey50", hjust = 1),
+    legend.title = element_text(face = "bold", size = 10),
+    legend.text = element_text(size = 9),
+    plot.margin = margin(20, 20, 15, 20)
+  )
+ggsave("Figures/fig5_population_map.png", width = 9, height = 8, dpi = 300)
+```
+
+------------------------------------------------------------------------
+
+# Method
+
+## Model Construction (3.1)
+
+Negative binomial GLMM, `log(population)` offset, random intercept for `hbt`. Final disease block (heart failure, depression) selected from Figure 4 and the collinearity check above.
+
+```{r model-final}
+obj1b_model <- glmmTMB(
+  frequent ~ age + sex + deprivation + department_type +
+    rate_heartfailure + rate_depression +
+    offset(log(population)) + (1 | hbt),
+  family = nbinom2, data = freq_data
+)
+summary(obj1b_model)
+```
+
+The random intercept is justified via an LRT against a variance-boundary null (no `hbt` term); the fixed-effect set must match exactly, or `df_diff != 1`.
+
+```{r random-effect-lrt}
+obj1b_null <- glmmTMB(
+  frequent ~ age + sex + deprivation + department_type +
+    rate_heartfailure + rate_depression +
+    offset(log(population)),
+  family = nbinom2, data = freq_data
+)
+
+lr_stat_b <- as.numeric(2 * (logLik(obj1b_model) - logLik(obj1b_null)))
+df_diff_b <- attr(logLik(obj1b_model), "df") - attr(logLik(obj1b_null), "df")
+lr_p_b    <- pchisq(lr_stat_b, df = df_diff_b, lower.tail = FALSE) / 2
+lr_stat_b; df_diff_b; lr_p_b
+
+icc(obj1b_model)
+```
+
+## Model Selection (3.2)
+
+Predictors were added in four blocks (age+sex, deprivation, department type, disease prevalence) rather than searched over, since a blind search would use the same data to choose and interpret the model. Each block is tested against the row above it via LRT and AIC (Table 1 of the report).
+
+```{r model-selection-table1}
+# M0: offset and (1|hbt) only
+m0 <- glmmTMB(frequent ~ offset(log(population)) + (1 | hbt),
+              family = nbinom2, data = freq_data)
+
+# M1: + age, sex
+m1 <- glmmTMB(frequent ~ age + sex + offset(log(population)) + (1 | hbt),
+              family = nbinom2, data = freq_data)
+
+# M2: + deprivation
+m2 <- glmmTMB(frequent ~ age + sex + deprivation + offset(log(population)) + (1 | hbt),
+              family = nbinom2, data = freq_data)
+
+# M3: + department type
+m3 <- glmmTMB(frequent ~ age + sex + deprivation + department_type +
+                offset(log(population)) + (1 | hbt),
+              family = nbinom2, data = freq_data)
+
+# M4: + heart failure, depression rate (= obj1b_model, the final specification)
+m4 <- obj1b_model
+
+# each row tested against the row above via LRT (block-wise, not term-by-term)
+lrt_block <- function(m_small, m_big) {
+  lr <- as.numeric(2 * (logLik(m_big) - logLik(m_small)))
+  df <- attr(logLik(m_big), "df") - attr(logLik(m_small), "df")
+  p  <- pchisq(lr, df = df, lower.tail = FALSE)
+  tibble(chisq = lr, df = df, p_value = p)
+}
+
+model_selection_table <- bind_rows(
+  tibble(model = "M0", predictors = "Offset and (1|hbt) only",
+         df = attr(logLik(m0), "df"), AIC = AIC(m0), chisq = NA, chisq_df = NA, p_value = NA),
+  bind_cols(model = "M1", predictors = "M0 + age, sex",
+            df = attr(logLik(m1), "df"), AIC = AIC(m1), lrt_block(m0, m1) %>% rename(chisq_df = df)),
+  bind_cols(model = "M2", predictors = "M1 + deprivation",
+            df = attr(logLik(m2), "df"), AIC = AIC(m2), lrt_block(m1, m2) %>% rename(chisq_df = df)),
+  bind_cols(model = "M3", predictors = "M2 + department type",
+            df = attr(logLik(m3), "df"), AIC = AIC(m3), lrt_block(m2, m3) %>% rename(chisq_df = df)),
+  bind_cols(model = "M4", predictors = "M3 + heart failure, depression rate",
+            df = attr(logLik(m4), "df"), AIC = AIC(m4), lrt_block(m3, m4) %>% rename(chisq_df = df))
+)
+
+model_selection_table %>%
+  knitr::kable(digits = 2, caption = "Model comparison for selecting final predictors (Table 1).")
+
+```
+
+M4 is taken forward as the final specification. Diagnostics follow in Section A.1.
+
+## Sensitivity Analysis for Final Model (3.3)
+
+### Model Assumption and Diagnostic (Appendix A.1)
+
+Simulation-based residual diagnostics from `DHARMa`, run on M4, avoid applying linear-model residual checks directly to count data.
+
+```{r dharma-diagnostics}
+obj1b_sim <- simulateResiduals(obj1b_model, n = 1000)
+
+png("Figures/diag_dharma_overall.png", width = 10, height = 5, units = "in", res = 300)
+plot(obj1b_sim)
+dev.off()
+
+png("Figures/diag_residuals.png", width = 8, height = 5, units = "in", res = 300)
+plotResiduals(obj1b_sim)
+dev.off()
+
+png("Figures/diag_outliers.png", width = 6, height = 5, units = "in", res = 300)
+testOutliers(obj1b_sim, type = "bootstrap")   # bootstrapped, preferred at this sample size
+dev.off()
+
+png("Figures/diag_dispersion.png", width = 6, height = 5, units = "in", res = 300)
+testDispersion(obj1b_sim)
+dev.off()
+
+png("Figures/diag_zeroinflation.png", width = 6, height = 5, units = "in", res = 300)
+testZeroInflation(obj1b_sim)   # this is the one that flags a genuine gap
+dev.off()
+```
+
+KS test and dispersion test both pass; the zero-inflation test does not (M4 under-predicts zero-count strata). This motivates the ZINB check below, reported as a limitation, not a change to the primary model.
+
+### Poisson vs NB vs ZINB comparison (Figures 6-7)
+
+```{r sensitivity-fit-comparators}
+pois_fit <- glmmTMB(frequent ~ age + sex + deprivation + department_type +
+                      rate_heartfailure + rate_depression +
+                      offset(log(population)) + (1 | hbt),
+                    family = poisson, data = freq_data)
+
+obj1b_zinb_dept <- glmmTMB(
+  frequent ~ age + sex + deprivation + department_type +
+    rate_heartfailure + rate_depression +
+    offset(log(population)) + (1 | hbt),
+  ziformula = ~ department_type,
+  family = nbinom2, data = freq_data
+)
+```
+
+```{r fig6-aic-zero-comparison}
+# Panel 1 - AIC comparison
+aic_df <- data.frame(
+  model = c("Poisson", "Negative Binomial (M4)", "ZINB (department type)"),
+  AIC = c(AIC(pois_fit), AIC(obj1b_model), AIC(obj1b_zinb_dept))
+)
+aic_df$model <- factor(aic_df$model, levels = aic_df$model)
+
+p1 <- ggplot(aic_df, aes(x = model, y = AIC, fill = model)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = round(AIC, 0)), vjust = -0.5) +
+  labs(title = "Model fit comparison (AIC)", x = NULL, y = "AIC") +
+  theme_minimal()
+
+# Panel 2 - observed vs model-expected zero-count strata
+obs_zeros <- sum(freq_data$frequent == 0)
+
+sim_pois <- simulateResiduals(pois_fit, n = 1000)
+sim_nb   <- simulateResiduals(obj1b_model, n = 1000)
+sim_zinb <- simulateResiduals(obj1b_zinb_dept, n = 1000)
+
+exp_zeros <- function(sim) mean(colSums(sim$simulatedResponse == 0))
+
+zero_df <- data.frame(
+  model = c("Observed", "Poisson", "Negative Binomial (M4)", "ZINB (department type)"),
+  zeros = c(obs_zeros, exp_zeros(sim_pois), exp_zeros(sim_nb), exp_zeros(sim_zinb))
+)
+zero_df$model <- factor(zero_df$model, levels = zero_df$model)
+
+p2 <- ggplot(zero_df, aes(x = model, y = zeros, fill = model == "Observed")) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = round(zeros, 0)), vjust = -0.5) +
+  scale_fill_manual(values = c("TRUE" = "firebrick", "FALSE" = "steelblue")) +
+  labs(title = "Observed vs model-expected zero-count strata", x = NULL, y = "Number of strata") +
+  theme_minimal()
+
+p1 + p2   # Figure 6
+ggsave("Figures/fig6_sensitivity_comparison.png", p1 + p2, width = 10, height = 5, dpi = 300)
+```
+
+```{r fig7-coefficient-comparison}
+extract_coefs <- function(model, label) {
+  tidy(model, effects = "fixed", conf.int = TRUE) %>%
+    filter(component == "cond", term != "(Intercept)") %>%
+    mutate(model = label)
+}
+
+coef_df <- bind_rows(
+  extract_coefs(pois_fit,        "Poisson"),
+  extract_coefs(obj1b_model,     "Negative Binomial (M4)"),
+  extract_coefs(obj1b_zinb_dept, "ZINB (department type)")
+)
+coef_df$model <- factor(coef_df$model,
+                        levels = c("Poisson", "Negative Binomial (M4)", "ZINB (department type)"))
+
+ggplot(coef_df, aes(x = estimate, y = term, colour = model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high),
+                  position = position_dodge(width = 0.6), size = 0.4) +
+  labs(title = "Fixed-effect coefficients across model specifications",
+       x = expression(beta~"(log scale)"), y = NULL, colour = "Model") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+ggsave("Figures/fig7_coef_comparison.png", width = 9, height = 7, dpi = 300)
+```
+
+M4 and the ZINB extension agree on almost every predictor. heart failure prevalence is the only coefficient that shifts meaningfully (Section 3.3 of the report).
+
+### Zero-inflated Negative Binomial Model (Appendix A.2)
+
+```{r appendix-a2-zinb-extension}
+# zero-inflation conditioned on department type only - the variable most
+# plausibly associated with structural zeros (Type 3 sites)
+zinb_ratio_dept <- exp_zeros(sim_zinb) / obs_zeros
+
+# also tested: zero-inflation ~ 1 (intercept-only) and ~ deprivation +
+# department_type, kept here as a documented negative result
+obj1b_zinb <- glmmTMB(
+  frequent ~ age + sex + deprivation + department_type +
+    rate_heartfailure + rate_depression +
+    offset(log(population)) + (1 | hbt),
+  ziformula = ~ 1,
+  family = nbinom2, data = freq_data
+)
+
+# adding deprivation reintroduced a separation problem (huge SEs on
+# deprivation2/4 in the zi component) - NOT carried forward, kept only
+# as evidence for why the department-type-only extension was preferred
+obj1b_zinb_dep_dept <- glmmTMB(
+  frequent ~ age + sex + deprivation + department_type +
+    rate_heartfailure + rate_depression +
+    offset(log(population)) + (1 | hbt),
+  ziformula = ~ deprivation + department_type,
+  family = nbinom2, data = freq_data
+)
+summary(obj1b_zinb_dep_dept)   # inspect the inflated SEs on deprivation terms
+
+AIC(obj1b_model, obj1b_zinb_dept)   # lower AIC = preferred, penalised for the extra zi parameter
+
+zinb_comparison <- bind_rows(
+  tidy(obj1b_model, effects = "fixed", exponentiate = TRUE, conf.int = TRUE) %>%
+    mutate(model = "NB (main)"),
+  tidy(obj1b_zinb, effects = "fixed", component = "cond",
+       exponentiate = TRUE, conf.int = TRUE) %>%
+    mutate(model = "ZINB (conditional)")
+) %>%
+  dplyr::filter(term != "(Intercept)") %>%
+  dplyr::select(model, term, estimate, conf.low, conf.high, p.value)
+
+print(zinb_comparison, n = Inf)
+
+
+ggplot(zinb_comparison, aes(x = term, y = estimate, ymin = conf.low, ymax = conf.high, colour = model)) +
+  geom_pointrange(position = position_dodge(width = 0.5)) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  coord_flip() +
+  scale_colour_manual(values = c("NB (main)" = "steelblue", "ZINB (conditional)" = "firebrick")) +
+  labs(title = "Sensitivity check: NB vs. zero-inflated NB",
+       subtitle = "Coefficients pointing the same direction/magnitude support the NB model's robustness",
+       x = NULL, y = "Rate ratio (95% CI)", colour = "Model") +
+  eda_theme
+ggsave("Figures/sensitivity3_zinb_comparison_plot.png", width = 9, height = 7, dpi = 300)
+
+# flag any coefficient that meaningfully diverges (direction flip or
+# non-overlapping CIs) - these need explicit discussion, not silent burial
+zinb_flag <- zinb_comparison %>%
+  dplyr::select(model, term, estimate) %>%
+  pivot_wider(names_from = model, values_from = estimate) %>%
+  mutate(
+    direction_flip = sign(log(`NB (main)`)) != sign(log(`ZINB (conditional)`)),
+    pct_diff = abs(`NB (main)` - `ZINB (conditional)`) / `NB (main)` * 100
+  ) %>%
+  arrange(desc(pct_diff))
+
+print(zinb_flag, n = Inf)
+
+```
+
+The ratio of observed to expected zero-count strata falls from 1.94 (M4) to about 1.4 once department type enters the zero-inflation component (Section A.2 of the report), confirming department type explains most, not all, of the excess zeros. M4 is retained as the primary specification throughout.
+
+### Robustness checks: disease block and attendance threshold
+
+```{r sensitivity-disease-block}
+# Check 1 - does the disease-prevalence block add anything on its own?
+obj1b_no_disease <- glmmTMB(
+  frequent ~ age + sex + deprivation + department_type +
+    offset(log(population)) + (1 | hbt),
+  family = nbinom2, data = freq_data
+)
+
+anova(obj1b_no_disease, obj1b_model)
+AIC(obj1b_no_disease, obj1b_model)
+```
+
+```{r sensitivity-threshold}
+# this one I didnt include in the report but worthwhile to check 
+# Check 2, does the 3+ threshold change the story vs 4+ / 5+?
+refit_freq_model <- function(threshold_data, label) {
+  m <- glmmTMB(
+    frequent ~ age + sex + deprivation + department_type +
+      rate_heartfailure + rate_depression +
+      offset(log(population)) + (1 | hbt),
+    family = nbinom2, data = threshold_data
+  )
+  tidy(m, effects = "fixed", exponentiate = TRUE, conf.int = TRUE) %>% mutate(threshold = label)
+}
+
+freq_data_thresholds <- freq_data %>%
+  mutate(frequent_3plus = three_attendances + four_attendances + five_plus_attendances,
+         frequent_4plus = four_attendances + five_plus_attendances,
+         frequent_5plus = five_plus_attendances)
+
+sensitivity_threshold <- bind_rows(
+  freq_data_thresholds %>% mutate(frequent = frequent_3plus) %>% refit_freq_model("3+ (main)"),
+  freq_data_thresholds %>% mutate(frequent = frequent_4plus) %>% refit_freq_model("4+"),
+  freq_data_thresholds %>% mutate(frequent = frequent_5plus) %>% refit_freq_model("5+")
+)
+
+
+ggplot(sensitivity_threshold %>% filter(term != "(Intercept)"),
+       aes(x = term, y = estimate, ymin = conf.low, ymax = conf.high, colour = threshold)) +
+  geom_pointrange(position = position_dodge(width = 0.5)) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  coord_flip() +
+  labs(title = "Sensitivity of rate ratios to the frequent-attender threshold",
+       x = NULL, y = "Rate ratio (95% CI)", colour = "Threshold") +
+  eda_theme
+ggsave("Figures/sensitivity2_threshold_plot.png", width = 9, height = 7, dpi = 300)
+```
+
+------------------------------------------------------------------------
+
+# Result and Discussion
+
+## Table 2: Fitted Coefficients and Rate Ratios
+
+```{r table2-results}
+table2_results <- tidy(obj1b_model, effects = "fixed", component = "cond",
+                        exponentiate = FALSE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(rate_ratio = exp(estimate),
+         ci_low = exp(conf.low), ci_high = exp(conf.high)) %>%
+  dplyr::select(term, estimate, rate_ratio, ci_low, ci_high, p.value)
+
+table2_results %>%
+  knitr::kable(digits = 3, caption = "Table 2. Fitted coefficients and rate ratios from the final negative binomial GLMM.")
+
+```
+
+Sections 4.1-4.4 of the report walk through these rate ratios block by block (age, sex, deprivation, department type, disease prevalence); no separate code is needed beyond the table above.
+
+## Health Board Random Effect (4.5)
+
+### Caterpillar plot (Figure 9)
+
+```{r fig9-caterpillar}
+# tidy() with ran_vals pulls the conditional variance needed for CIs,
+# unlike ranef() alone
+board_effects_ci <- tidy(obj1b_model, effects = "ran_vals", conf.int = TRUE) %>%
+  filter(group == "hbt") %>%
+  rename(hbt = level, log_effect = estimate) %>%
+  mutate(
+    rate_ratio = exp(log_effect),
+    ci_low     = exp(conf.low),
+    ci_high    = exp(conf.high),
+    # significant if the 95% CI excludes 1 (genuinely differs from expected)
+    significant = if_else(ci_low > 1 | ci_high < 1, "Significant", "Not significant")
+  ) %>%
+  arrange(rate_ratio) %>%
+  mutate(hbt_rank = row_number())
+
+
+hb_lookup <- hb_boundaries %>% st_drop_geometry() %>% dplyr::select(HBCode, HBName)
+
+board_effects_ci <- board_effects_ci %>%
+  left_join(hb_lookup, by = c("hbt" = "HBCode")) %>%
+  mutate(hbt = factor(HBName, levels = HBName[order(rate_ratio)]))
+
+ggplot(board_effects_ci, aes(x = hbt, y = rate_ratio, colour = significant)) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey40") +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0, linewidth = 0.4, alpha = 0.7) +
+  geom_point(size = 1.6) +
+  scale_colour_manual(values = c("Significant" = "firebrick", "Not significant" = "steelblue")) +
+  labs(
+    title = "Adjusted Frequent-Attender Rate Ratios Across Health Boards",
+    subtitle = "Ranked by rate ratio vs. model expectation, with 95% CI",
+    x = "Health Board", y = "Rate ratio vs. expected", colour = NULL,
+    caption = "After adjusting for age, sex, deprivation, department type, and disease prevalence"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, colour = "grey40", hjust = 0.5),
+    plot.caption = element_text(size = 8, colour = "grey50"),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8)
+  )
+ggsave("Figures/fig9_board_effects_caterpillar.png", width = 9, height = 6, dpi = 300)
+```
+
+Only Tayside, Forth Valley, and Dumfries and Galloway have CIs that exclude 1; the remaining eleven boards sit within the range chance would produce.
+
+### Map (Figure 8)
+
+```{r fig8-board-map}
+board_effects <- ranef(obj1b_model)$cond$hbt %>%
+  rownames_to_column("hbt") %>%
+  rename(log_effect = `(Intercept)`) %>%
+  mutate(rate_ratio_vs_expected = exp(log_effect),
+         direction = if_else(log_effect > 0, "Higher than expected", "Lower than expected")) %>%
+  arrange(desc(rate_ratio_vs_expected))
+
+
+hb_map_data <- hb_boundaries %>%
+  left_join(board_effects, by = c("HBCode" = "hbt")) %>%
+  mutate(label_text = paste0(HBName, "\n", sprintf("%.2f", rate_ratio_vs_expected)))
+
+ggplot(hb_map_data) +
+  geom_sf(aes(fill = rate_ratio_vs_expected), colour = "white", linewidth = 0.3) +
+  geom_sf_text(aes(label = label_text), size = 2.4, colour = "grey15",
+               fontface = "bold", lineheight = 0.85, check_overlap = TRUE) +
+  scale_fill_gradient2(
+    low = "steelblue", mid = "white", high = "firebrick", midpoint = 1,
+    labels = scales::number_format(accuracy = 0.01),
+    name = "Rate ratio\nvs. expected"
+  ) +
+  labs(
+    title = "Frequent-Attender Rate by Health Board: Observed vs. Model-Expected",
+    subtitle = "Red = higher than expected; blue = lower than expected, after adjusting for\nage, sex, deprivation, department type, and disease prevalence",
+    caption = "Values are rate ratios (1 = as expected). Boundaries: NHS Scotland Health Boards, 2019."
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5, margin = margin(b = 4)),
+    plot.subtitle = element_text(size = 9.5, colour = "grey40", hjust = 0.5, margin = margin(b = 10)),
+    plot.caption = element_text(size = 8, colour = "grey50", hjust = 1, margin = margin(t = 10)),
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 10),
+    legend.text = element_text(size = 9),
+    plot.margin = margin(15, 15, 15, 15)
+  )
+ggsave("Figures/fig8_board_effects_map.png", width = 9, height = 8, dpi = 300)
+```
+
+------------------------------------------------------------------------
+
+# Appendix A.3: Age-by-Sex Interaction Model
+
+The main text reports the additive model. This tests `age * sex` in place of the additive terms, as a robustness check reported in Appendix A.3 and revisited in the Limitations section.
+
+```{r appendix-a3-interaction}
+obj1b_model_int <- glmmTMB(
+  frequent ~ age * sex + deprivation + department_type +
+    rate_heartfailure + rate_depression +
+    offset(log(population)) + (1 | hbt),
+  family = nbinom2, data = freq_data
+)
+
+anova(obj1b_model, obj1b_model_int)
+summary(obj1b_model_int)
+
+interaction_table <- tidy(obj1b_model_int, effects = "fixed", component = "cond",
+                           conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(rate_ratio = exp(estimate), ci_low = exp(conf.low), ci_high = exp(conf.high))
+
+interaction_table %>%
+  knitr::kable(digits = 3, caption = "Table 3. Age-by-sex interaction model, conditional model coefficients.")
+
+```
+
+Only the 18-24 x Male interaction is significant; the other four age bands show no departure from the additive pattern. The additive model (M4) is retained as the primary specification, and the young-men result is flagged for further work rather than folded into the general age effect (Section 6 of the report).
+
+------------------------------------------------------------------------
+
+*End of analysis. All random operations use `seed = 42` for reproducibility.*
