@@ -49,7 +49,7 @@ local copies of the raw extracts below.
 └── README.md
 ```
 
-
+due to copyright, I couldn't share literatures. However, if you wanna read the literature, you can email me s2744048@ed.ac.uk ^.^
 ---
 
 ## Methodology Summary
