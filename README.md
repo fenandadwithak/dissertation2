@@ -1,11 +1,10 @@
 # Frequent A&E Attendance in Scotland
 
-A multilevel analysis of demographic, deprivation, and disease-burden drivers of frequent A&E
-attendance across Scotland's 14 Health Boards, built for Public Health Scotland's Whole System
-Modelling (WSM) programme.
+## A multilevel analysis of demographic, deprivation, and disease-burden drivers of frequent A&E attendance across Scotland's 14 Health Boards
 
-MSc Statistics with Data Science, University of Edinburgh — July 2026
-Supervised by Nicole Augustin and Ioannis Papastathopoulos
+> Fenanda Dwitha Kurniasari (S2744048)
+> MSc Statistics with Data Science, University of Edinburgh  (July 2026)
+
 
 ---
 
@@ -87,9 +86,10 @@ install.packages(c(
 
 
 
-## Author
+## Supervisors
 
-Fenanda Dwitha Kurniasari (S2744048) — MSc Statistics with Data Science, University of Edinburgh
+Supervised by Nicole Augustin and Ioannis Papastathopoulos
+
 
 ## Acknowledgements
 
