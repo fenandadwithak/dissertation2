@@ -11,7 +11,7 @@ Supervised by Nicole Augustin and Ioannis Papastathopoulos
 
 ## Overview
 
-A small group of frequent attenders — people with three or more A&E visits in a year — accounts for
+A small group of frequent attenders(people with three or more A&E visits in a year) accounts for
 a disproportionate share of demand on Scotland's emergency departments. This project models twelve
 months of Public Health Scotland attendance data (rolling year to April 2026) to identify who this
 group is and where attendance pressure concentrates, using a negative binomial generalised linear
@@ -22,7 +22,7 @@ mixed model (GLMM) with a Health Board random intercept.
 
 ## Data Sources
 
-All data is publicly available. None is redistributed in this repository — scripts download or expect
+All data is publicly available. None is redistributed in this repository, scripts download or expect
 local copies of the raw extracts below.
 
 | # | Dataset | Source | Used for |
