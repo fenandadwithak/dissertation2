@@ -2,3 +2,14 @@
 .Rhistory
 .RData
 .Ruserdata
+
+# Raw data — not redistributed per README (see Data Sources section)
+Data/*.csv
+Data/*.xlsx
+Data/*.xls
+Data/*.shp
+Data/*.shx
+Data/*.dbf
+Data/*.prj
+Data/*.cpg
+Data/*.zip
