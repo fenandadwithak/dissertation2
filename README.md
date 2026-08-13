@@ -41,13 +41,11 @@ local copies of the raw extracts below.
 
 ```
 .
-├── data/                  # Data Input              
-│   └── raw/            
-├── scripts/               # R scripts / R Markdown
-│   └── script.Rmd        
-├── figures/               # exported plots (PNG, used in the report)
-├── report/                # dissertation PDF 
-├── references/            # journal and literatures
+├── Data/                          # Data Input                         
+├── script_project_2_Fenanda.Rmd   # R scripts / R Markdown         
+├── Figures/                       # exported plots (PNG, used in the report)
+├── Report/                        # dissertation PDF 
+├── Publication/                   # journal and literatures
 └── README.md
 ```
 
