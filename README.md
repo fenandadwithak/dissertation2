@@ -1,9 +1,9 @@
 # Frequent A&E Attendance in Scotland
 
-## A multilevel analysis of demographic, deprivation, and disease-burden drivers of frequent A&E attendance across Scotland's 14 Health Boards
+## Mapping Emergency Demand: The Deprivation, Demographic, Disease Buden, and Department Patterns Behind Frequent A\&E Attendance in Scotland
 
-> Fenanda Dwitha Kurniasari (S2744048)
-MSc Statistics with Data Science, University of Edinburgh  (July 2026)
+> Fenanda Dwitha Kurniasari (S2744048), MSc Statistics with Data Science (Candidate)
+
 
 
 ---
