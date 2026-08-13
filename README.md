@@ -3,7 +3,7 @@
 ## A multilevel analysis of demographic, deprivation, and disease-burden drivers of frequent A&E attendance across Scotland's 14 Health Boards
 
 > Fenanda Dwitha Kurniasari (S2744048)
-> MSc Statistics with Data Science, University of Edinburgh  (July 2026)
+MSc Statistics with Data Science, University of Edinburgh  (July 2026)
 
 
 ---
